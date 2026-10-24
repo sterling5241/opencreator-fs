@@ -1,13 +1,21 @@
 #!/bin/sh
 # Live MCU firmware update on the SoC, without a USB stick or power cycle.
-# Usage: oc-mcu-flash DIR   (DIR holds any of eBoard.hex heaterBoard.hex
-#                            levelBoard.hex mainBoardGD.hex)
-# See config-docs/CREATOR5_LIVE_MCU_FLASH.md.
+# Usage: oc-mcu-flash DIR
+# Creator 5 (Pro): DIR holds any of eBoard.hex heaterBoard.hex levelBoard.hex
+#   mainBoardGD.hex. See config-docs/CREATOR5_LIVE_MCU_FLASH.md.
+# AD5X: DIR holds any of AD5X-mainboard.bin AD5X-ifs.hex AD5X-eboard.hex
+#   (mcu-firmware/ad5x). The mainboard and IFS flash live; the eboard
+#   bootloader only listens after a power-on, before anything wakes it, so
+#   its hex is staged in mcu-flash-pending/ and flashed by startup.sh at the
+#   next power cycle.
 
 DIR=${1:-}
 LOG=/usr/data/logs/oc-mcu-flash.log
 MR=http://127.0.0.1:7125
 WORK=/tmp/oc-mcu-flash
+HERE=$(dirname "$(readlink -f "$0")")
+PENDING_DIR=/usr/data/opencreator/mcu-flash-pending
+PY=/usr/data/python-hf/bin/python3.13
 
 die() { echo "oc-mcu-flash: $*" >&2; exit 1; }
 say() { echo "$*"; echo "$(date '+%F %T') $*" >> "$LOG"; }
@@ -15,17 +23,30 @@ say() { echo "$*"; echo "$(date '+%F %T') $*" >> "$LOG"; }
 [ -n "$DIR" ] && [ -d "$DIR" ] || die "usage: oc-mcu-flash DIR"
 DIR=$(cd "$DIR" && pwd)
 CONTROL=$(ls -d /usr/prog/PROGRAM/control/[0-9]* 2>/dev/null | sort | tail -n 1)
-IAP=$CONTROL/IAPCommand
-ISP=$CONTROL/ISPCommand
-[ -x "$IAP" ] && [ -x "$ISP" ] || die "no IAPCommand/ISPCommand in $CONTROL"
+MACHINE=$(sed -n 's/^[[:space:]]*MACHINE=\([A-Za-z0-9]*\).*/\1/p' \
+    /usr/prog/app_startup.sh /usr/prog/PROGRAM/runFirmwareExe.sh 2>/dev/null | head -n 1)
 
-# board: hex file, tty, Klipper mcu name
+if [ "$MACHINE" = AD5X ]; then
+    NATIONS=$CONTROL/NationsCommand
+    IAP=$CONTROL/IAPCommand
+    IFSCMD=$CONTROL/IFSCommand
+    [ -f "$DIR/AD5X-mainboard.bin" ] || [ -f "$DIR/AD5X-ifs.hex" ] || \
+        [ -f "$DIR/AD5X-eboard.hex" ] || die "no AD5X firmware files in $DIR"
+else
+    IAP=$CONTROL/IAPCommand
+    ISP=$CONTROL/ISPCommand
+    [ -x "$IAP" ] && [ -x "$ISP" ] || die "no IAPCommand/ISPCommand in $CONTROL"
+fi
+
+# Creator 5 IAP boards: hex file, tty, Klipper mcu name
 IAP_BOARDS="eBoard.hex:/dev/ttyS5:eboard heaterBoard.hex:/dev/ttyS4:eheaterboard levelBoard.hex:/dev/ttyS7:levelboard"
 names=
-for b in $IAP_BOARDS; do
-    [ -f "$DIR/${b%%:*}" ] && names="$names${names:+,}${b##*:}"
-done
-[ -n "$names" ] || [ -f "$DIR/mainBoardGD.hex" ] || die "no .hex files in $DIR"
+if [ "$MACHINE" != AD5X ]; then
+    for b in $IAP_BOARDS; do
+        [ -f "$DIR/${b%%:*}" ] && names="$names${names:+,}${b##*:}"
+    done
+    [ -n "$names" ] || [ -f "$DIR/mainBoardGD.hex" ] || die "no .hex files in $DIR"
+fi
 
 state=$(curl -s -m 5 "$MR/printer/objects/query?print_stats=state" |
         sed -n 's/.*"state": *"\([a-z]*\)".*/\1/p')
@@ -35,7 +56,7 @@ esac
 
 pids_of() {
     for d in /proc/[0-9]*; do
-        tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q "$1" &&
+        { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null | grep -q "$1" &&
             echo "${d#/proc/}"
     done
 }
@@ -48,10 +69,10 @@ resume() {
 }
 trap resume EXIT INT TERM HUP
 
-say "flashing from $DIR: ${names:-}${names:+ }$([ -f "$DIR/mainBoardGD.hex" ] && echo mainboard)"
+say "flashing from $DIR ($MACHINE)"
 # The wake script would release the boards from their boot stage
 [ -n "$WAKE" ] && kill -STOP $WAKE
-if [ -n "$names" ]; then
+if [ "$MACHINE" != AD5X ] && [ -n "$names" ]; then
     r=$(curl -s -m 10 -X POST "$MR/printer/gcode/script?script=C5_MCU_BOOTLOADER%20BOARDS=$names")
     case "$r" in
         *'"result"'*) ;;
@@ -65,28 +86,86 @@ KLIPPY=$(pids_of 'klippy/klippy\.py')
 
 rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK" || die "no $WORK"
 failed=
-for b in $IAP_BOARDS; do
-    hex=${b%%:*}; rest=${b#*:}; tty=${rest%%:*}; name=${b##*:}
-    [ -f "$DIR/$hex" ] || continue
-    saved=$(stty -g -F "$tty")
-    ok=
-    for try in 1 2 3; do
-        "$IAP" "$DIR/$hex" "$tty" > "$WORK/$name.log" 2>&1
-        if grep -qE "STM32Write: success|sendFileSuccessful" "$WORK/$name.log"; then ok=1; break; fi
-    done
-    stty -F "$tty" "$saved"
-    cat "$WORK/$name.log" >> "$LOG"
-    if [ -n "$ok" ]; then say "$name: flashed"; else say "$name: FAILED"; failed=1; fi
+
+if [ "$MACHINE" = AD5X ]; then
+    if [ -f "$DIR/AD5X-mainboard.bin" ]; then
+        [ -x "$NATIONS" ] || die "no NationsCommand in $CONTROL"
+        saved=$(stty -g -F /dev/ttyS2)
+        # ROM bootloader on ttyS2; NationsCommand pulses BOOT0/RESET itself
+        (cd "$CONTROL" && ./NationsCommand -c -d --fn "$DIR/AD5X-mainboard.bin" --v -r) \
+            > "$WORK/mainboard.log" 2>&1
+        stty -F /dev/ttyS2 "$saved"
+        cat "$WORK/mainboard.log" >> "$LOG"
+        if grep -q "verification succeeded" "$WORK/mainboard.log"; then
+            say "mainboard: flashed"
+        else
+            say "mainboard: FAILED"; failed=1
+        fi
+    fi
+    if [ -f "$DIR/AD5X-ifs.hex" ]; then
+        [ -x "$IFSCMD" ] || die "no IFSCommand in $CONTROL"
+        [ -x "$PY" ] || die "no $PY"
+        saved=$(stty -g -F /dev/ttyS4)
+        # IFSCommand generates the XMODEM frames; the IFS firmware drops to
+        # its bootloader on the request string (half-duplex RS485)
+        ok=
+        if "$PY" "$HERE/ifs_capture.py" "$IFSCMD" "$DIR/AD5X-ifs.hex" "$WORK/ifs.frames" \
+                > "$WORK/ifs.log" 2>&1 &&
+            "$PY" -c "
+import os,termios
+fd=os.open('/dev/ttyS4',os.O_RDWR|os.O_NOCTTY)
+a=termios.tcgetattr(fd); a[0]=0;a[1]=0;a[2]=termios.CS8|termios.CREAD|termios.CLOCAL;a[3]=0;a[4]=a[5]=termios.B115200
+termios.tcsetattr(fd,termios.TCSANOW,a)
+os.write(fd,b'~ \x1c Request Serial Bootloader!! ~'); termios.tcdrain(fd)
+" >> "$WORK/ifs.log" 2>&1 &&
+            "$PY" "$HERE/ifs_catch.py" /dev/ttyS4 "$WORK/ifs.frames" 20 \
+                >> "$WORK/ifs.log" 2>&1; then
+            ok=1
+        fi
+        stty -F /dev/ttyS4 "$saved"
+        cat "$WORK/ifs.log" >> "$LOG"
+        if [ -n "$ok" ]; then say "ifs: flashed"; else say "ifs: FAILED"; failed=1; fi
+    fi
+    if [ -f "$DIR/AD5X-eboard.hex" ]; then
+        [ -x "$IAP" ] || die "no IAPCommand in $CONTROL"
+        mkdir -p "$PENDING_DIR"
+        cp "$DIR/AD5X-eboard.hex" "$PENDING_DIR/AD5X-eboard.hex"
+        cat > "$PENDING_DIR/flash.sh" <<EOF
+#!/bin/sh
+# Written by oc-mcu-flash; run once by startup.sh at power-on, while the
+# AD5X eboard bootloader still waits (before anything sends it 'A').
+mv "$PENDING_DIR/flash.sh" "$PENDING_DIR/flash.sh.ran"
+for try in 1 2 3; do
+    "$IAP" "$PENDING_DIR/AD5X-eboard.hex" /dev/ttyS5 && break
 done
-if [ -f "$DIR/mainBoardGD.hex" ]; then
-    saved=$(stty -g -F /dev/ttyS2)
-    "$ISP" "$DIR/mainBoardGD.hex" /dev/ttyS2 115200 > "$WORK/mcu.log" 2>&1
-    stty -F /dev/ttyS2 "$saved"
-    cat "$WORK/mcu.log" >> "$LOG"
-    if grep -q "finished successfully" "$WORK/mcu.log"; then
-        say "mainboard: flashed"
-    else
-        say "mainboard: FAILED"; failed=1
+EOF
+        say "eboard: staged for the next POWER CYCLE (not a reboot command:"
+        say "eboard: the bootloader only waits after real power-on)"
+    fi
+else
+    for b in $IAP_BOARDS; do
+        hex=${b%%:*}; rest=${b#*:}; tty=${rest%%:*}; name=${b##*:}
+        [ -f "$DIR/$hex" ] || continue
+        saved=$(stty -g -F "$tty")
+        ok=
+        for try in 1 2 3; do
+            "$IAP" "$DIR/$hex" "$tty" > "$WORK/$name.log" 2>&1
+            if grep -qE "STM32Write: success|sendFileSuccessful" "$WORK/$name.log"; then ok=1; break; fi
+        done
+        stty -F "$tty" "$saved"
+        cat "$WORK/$name.log" >> "$LOG"
+        if [ -n "$ok" ]; then say "$name: flashed"; else say "$name: FAILED"; failed=1; fi
+    done
+    if [ -f "$DIR/mainBoardGD.hex" ]; then
+        saved=$(stty -g -F /dev/ttyS2)
+        "$ISP" "$DIR/mainBoardGD.hex" /dev/ttyS2 115200 > "$WORK/mcu.log" 2>&1
+        stty -F /dev/ttyS2 "$saved"
+        cat "$WORK/mcu.log" >> "$LOG"
+        if grep -q "finished successfully" "$WORK/mcu.log"; then
+            say "mainboard: flashed"
+        else
+            say "mainboard: FAILED"; failed=1
+        fi
     fi
 fi
 
@@ -96,7 +175,7 @@ for i in $(seq 1 45); do
     sleep 2
     curl -s -m 5 "$MR/printer/info" | grep -q '"state": *"ready"' && break
 done
-curl -s -m 5 "$MR/printer/objects/query?mcu=mcu_version&mcu%20eboard=mcu_version&mcu%20eheaterboard=mcu_version&mcu%20levelboard=mcu_version" |
+curl -s -m 5 "$MR/printer/objects/query?mcu=mcu_version&mcu%20eboard=mcu_version&mcu%20eheaterboard=mcu_version&mcu%20levelboard=mcu_version&mcu%20ifs=mcu_version" |
     grep -o '"mcu[^"]*": *{"mcu_version": *"[^"]*"' | sed 's/{"mcu_version": *//; s/"//g' |
     while IFS= read -r line; do say "$line"; done
 [ -z "$failed" ] || die "some boards failed; see $LOG"

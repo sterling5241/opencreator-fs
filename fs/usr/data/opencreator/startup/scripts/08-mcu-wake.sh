@@ -20,7 +20,19 @@ log() {
 }
 
 # mcu name -> tty, Klipper baud, wake parity order
+MACHINE=$(sed -n 's/^[[:space:]]*MACHINE=\([A-Za-z0-9]*\).*/\1/p' \
+    /usr/prog/app_startup.sh /usr/prog/PROGRAM/runFirmwareExe.sh 2>/dev/null | head -n 1)
 board() {
+    if [ "$MACHINE" = AD5X ]; then
+        # only the eboard has the Ready/A boot stage; ttyS2 is the mainboard
+        # (boots straight into the app) and ttyS4 the IFS (RS485, its
+        # bootloader speaks XMODEM, not Ready/A)
+        case "$1" in
+            eboard) echo "/dev/ttyS5 230400 N E" ;;
+            *) return 1 ;;
+        esac
+        return 0
+    fi
     case "$1" in
         eheaterboard|heaterboard) echo "/dev/ttyS4 230400 N E" ;;
         eboard) echo "/dev/ttyS5 460800 E N" ;;

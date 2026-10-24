@@ -11,11 +11,12 @@ log_launcher() {
 
 # AFC stops with an error while its variables file is missing or empty; it
 # fills the file in itself once it has state to save.
-AFC_VARS=$OC/config/AFC/AFC.var.unit
-if [ ! -s "$AFC_VARS" ]; then
-    mkdir -p "$OC/config/AFC"
-    echo '{}' > "$AFC_VARS"
-fi
+for AFC_VARS in "$OC/config/AFC/AFC.var.unit" "$OC/config/AFC/AFC.var"; do
+    if [ ! -s "$AFC_VARS" ]; then
+        mkdir -p "$OC/config/AFC"
+        echo '{}' > "$AFC_VARS"
+    fi
+done
 
 # printer.base.cfg gets the Pro-only hardware (chamber heater, chamber and aux
 # fans: printer.pro.cfg) through printer.model.cfg. The model is read from the
@@ -27,6 +28,7 @@ case $MACHINE in
     Creator5Pro) MODEL_TEXT='# Written at boot: Creator 5 Pro
 [include printer.pro.cfg]' ;;
     Creator5) MODEL_TEXT='# Written at boot: Creator 5 (no chamber heater, chamber fans or aux fan)' ;;
+    AD5X) MODEL_TEXT='# Written at boot: AD5X' ;;
     *) MODEL_TEXT= ;;
 esac
 if [ -n "$MODEL_TEXT" ]; then
